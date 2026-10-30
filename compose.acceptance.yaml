@@ -1,0 +1,10 @@
+# Compose 2.24.4+: disposable acceptance never publishes host ports.
+services:
+  pg1:
+    ports: !reset []
+  pg2:
+    ports: !reset []
+  pg3:
+    ports: !reset []
+  haproxy:
+    ports: !reset []

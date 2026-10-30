@@ -1,0 +1,120 @@
+name: patroni-lab
+
+x-etcd: &etcd
+  image: quay.io/coreos/etcd:v3.6.5
+  entrypoint: [/usr/local/bin/etcd]
+  command:
+    - --data-dir=/etcd-data
+    - --listen-client-urls=http://0.0.0.0:2379
+    - --listen-peer-urls=http://0.0.0.0:2380
+    - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+    - --initial-cluster-token=patroni-learning
+    - --initial-cluster-state=new
+  healthcheck:
+    test: [CMD, /usr/local/bin/etcdctl, --endpoints=http://127.0.0.1:2379, endpoint, health]
+    interval: 3s
+    timeout: 3s
+    retries: 30
+  mem_limit: 256m
+
+x-pg-env: &pg-env
+  PATRONI_SUPERUSER_PASSWORD: ${PATRONI_SUPERUSER_PASSWORD:?Run make setup first}
+  PATRONI_REPLICATION_PASSWORD: ${PATRONI_REPLICATION_PASSWORD:?Run make setup first}
+
+x-pg: &pg
+  image: patroni-learning:4.1.5-pg17.11
+  build: .
+  environment: *pg-env
+  depends_on:
+    etcd1: {condition: service_healthy}
+    etcd2: {condition: service_healthy}
+    etcd3: {condition: service_healthy}
+  healthcheck:
+    test: [CMD, python3, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8008/health', timeout=2)"]
+    interval: 3s
+    timeout: 3s
+    retries: 40
+    start_period: 10s
+  stop_grace_period: 30s
+  shm_size: 128mb
+  mem_limit: 384m
+
+services:
+  etcd1:
+    <<: *etcd
+    hostname: etcd1
+    # Unique member identity and advertised addresses within this Compose network.
+    environment:
+      ETCD_NAME: etcd1
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd1:2379
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd1:2380
+    volumes: [etcd1:/etcd-data]
+  etcd2:
+    <<: *etcd
+    hostname: etcd2
+    environment:
+      ETCD_NAME: etcd2
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd2:2379
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd2:2380
+    volumes: [etcd2:/etcd-data]
+  etcd3:
+    <<: *etcd
+    hostname: etcd3
+    environment:
+      ETCD_NAME: etcd3
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd3:2379
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd3:2380
+    volumes: [etcd3:/etcd-data]
+
+  pg1:
+    <<: *pg
+    environment:
+      <<: *pg-env
+      PATRONI_NAME: pg1
+      PATRONI_RESTAPI_CONNECT_ADDRESS: pg1:8008
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg1:5432
+    ports: ['127.0.0.1:8001:8008']
+    volumes: [pg1:/var/lib/postgresql/patroni]
+  pg2:
+    <<: *pg
+    environment:
+      <<: *pg-env
+      PATRONI_NAME: pg2
+      PATRONI_RESTAPI_CONNECT_ADDRESS: pg2:8008
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg2:5432
+    ports: ['127.0.0.1:8002:8008']
+    volumes: [pg2:/var/lib/postgresql/patroni]
+  pg3:
+    <<: *pg
+    environment:
+      <<: *pg-env
+      PATRONI_NAME: pg3
+      PATRONI_RESTAPI_CONNECT_ADDRESS: pg3:8008
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg3:5432
+    ports: ['127.0.0.1:8003:8008']
+    volumes: [pg3:/var/lib/postgresql/patroni]
+
+  haproxy:
+    image: haproxy:3.2-alpine
+    volumes: ['./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro']
+    ports:
+      - '127.0.0.1:55432:5000'
+      - '127.0.0.1:55433:5001'
+    depends_on:
+      pg1: {condition: service_healthy}
+      pg2: {condition: service_healthy}
+      pg3: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, haproxy, -c, -f, /usr/local/etc/haproxy/haproxy.cfg]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    mem_limit: 64m
+
+volumes:
+  etcd1:
+  etcd2:
+  etcd3:
+  pg1:
+  pg2:
+  pg3:
