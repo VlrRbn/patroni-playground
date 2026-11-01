@@ -51,7 +51,9 @@ make up
 make status
 ```
 
-Ожидай одного `Leader` и две `Replica` в состоянии `streaming`.
+В исходном асинхронном режиме ожидается один `Leader` и две `Replica`
+в состоянии `streaming`. После включения синхронного режима одна реплика
+будет обозначена как `Sync Standby`.
 Первым лидером может стать любой узел. Сборка в первый раз занимает несколько минут.
 Если запуск завершился ошибкой: `docker compose logs --tail=80`.
 
@@ -87,6 +89,14 @@ SELECT * FROM notes;
 У primary `pg_is_in_recovery()` возвращает `false`. Запомни IP сервера:
 позже он поможет заметить переключение. Выход из `psql`: `\q`.
 
+HAProxy допускает до часа бездействия SQL-соединения (`timeout client` и
+`timeout server` в `haproxy.cfg`). После более долгой паузы соединение может
+закрыться; `Attempting reset: Succeeded` означает, что `psql` подключился заново.
+Это новый сеанс: временные таблицы и настройки предыдущего сеанса не сохраняются.
+Открытая транзакция, до COMMIT которой дело не дошло, откатывается.
+Если связь потеряна во время самого COMMIT, его результат может быть
+неизвестен клиенту; перед повтором операции проверь данные.
+
 ## 2. Читаем с реплики
 
 ```bash
@@ -102,7 +112,8 @@ INSERT INTO notes (body) VALUES ('Запись с реплики?');
 ```
 
 Ожидай `true`, строку из первого упражнения и ошибку `read-only transaction`
-при вставке. Данные могут появиться с небольшой задержкой: репликация асинхронная.
+при вставке. В исходной конфигурации репликация асинхронная, поэтому данные
+могут появиться с небольшой задержкой.
 HAProxy выбирает узел при установлении соединения. Один сеанс `psql` остаётся
 на одной реплике; переподключение может привести на другую.
 
@@ -116,7 +127,7 @@ SELECT application_name, state, sync_state,
 FROM pg_stat_replication;
 ```
 
-Ожидай две строки: `state = streaming`, `sync_state = async`.
+В исходном асинхронном режиме ожидай две строки: `state = streaming`, `sync_state = async`.
 LSN — позиция в WAL. Эти столбцы показывают этапы доставки:
 отправка, запись, сброс на диск и воспроизведение на реплике.
 
@@ -244,6 +255,438 @@ make status
 make sql
 ```
 
+## 8. Синхронная репликация
+
+Проверяем, чего именно ждёт подтверждение транзакции и как доступность
+записи зависит от работающих реплик.
+Динамическая конфигурация сохраняется в etcd между остановками стенда.
+
+### Что означает synchronous_commit
+
+`synchronous_commit` — настройка PostgreSQL: какие действия с WAL должны
+завершиться до успешного ответа клиенту на `COMMIT`. Отдельный `INSERT`
+без `BEGIN` тоже выполняется в собственной транзакции.
+
+| Настройки | Что требуется для подтверждения COMMIT |
+| --- | --- |
+| `synchronous_commit=off`, синхронные реплики не назначены | WAL сохранён на диске лидера |
+| `synchronous_commit=on`, назначена одна синхронная реплика | WAL сохранён на диске лидера и этой реплики |
+
+Реплика с `sync_state=async` тоже получает WAL, но её подтверждение не требуется
+для успешного `COMMIT`. `Sync Standby` означает «синхронная реплика»;
+подтверждения ждёт лидер. Сохранение WAL на реплике ещё не означает, что он уже
+воспроизведён и изменения доступны для чтения на ней.
+
+### Включаем одну синхронную реплику
+
+Начинай с трёх здоровых PostgreSQL-узлов. В примере лидер — `pg2`,
+реплики — `pg1` и `pg3`. Перед каждой остановкой сверяй роли через `make status`:
+если имена отличаются, подставляй фактические имена узлов.
+
+```bash
+make status NODE=pg2
+make ctl NODE=pg2 ARGS="edit-config --set synchronous_mode=true --set synchronous_node_count=1 --set synchronous_mode_strict=true"
+```
+
+Подтверди изменения. Эти настройки меняются через DCS; правка `bootstrap.dcs`
+в существующем кластере их не изменит.
+
+- `synchronous_mode=true`: Patroni назначает синхронные реплики и ограничивает
+  круг узлов, которым разрешено автоматическое повышение.
+- `synchronous_node_count=1`: достаточно подтверждения одной синхронной реплики.
+- `synchronous_mode_strict=true`: при отсутствии подходящих реплик Patroni
+  сохраняет требование синхронного подтверждения; `COMMIT` будет ждать.
+
+Через несколько секунд:
+
+```bash
+make status NODE=pg2
+make sql NODE=pg2
+```
+
+```sql
+SHOW synchronous_commit;
+SHOW synchronous_standby_names;
+SELECT application_name, state, sync_state
+FROM pg_stat_replication
+ORDER BY application_name;
+```
+
+Ожидай `synchronous_commit=on`, непустой список синхронных реплик и одну строку
+с `sync_state=sync`. В следующих примерах первоначально выбран `pg3`, а `pg1`
+остаётся асинхронной репликой. В `patronictl list` выбранный узел отображается
+как `Sync Standby`.
+
+### Теряем синхронную реплику
+
+Выйди из `psql` через `\q`. Останови выбранную синхронную реплику:
+
+```bash
+docker compose kill -s SIGKILL pg3
+make status NODE=pg2
+```
+
+Дождись, пока `pg1` станет `Sync Standby`. Лидер остаётся `pg2`, timeline
+не меняется: здесь нет повышения нового primary. Статус остановленного `pg3`
+может некоторое время оставаться в DCS; фактическое состояние контейнеров
+видно в `docker compose ps -a`.
+
+```bash
+make sql NODE=pg2
+```
+
+```sql
+SHOW synchronous_standby_names;
+INSERT INTO notes (body)
+VALUES ('Запись после замены синхронной реплики') RETURNING *;
+```
+
+Ожидай `pg1` в настройке и успешную вставку. `pg3` пока остаётся остановленным.
+
+### Теряем все реплики в строгом режиме
+
+Оставь первый терминал с `psql`, подключённым к лидеру. Во втором терминале
+из папки проекта останови оставшуюся реплику:
+
+```bash
+docker compose kill -s SIGKILL pg1
+```
+
+В первом терминале:
+
+```sql
+BEGIN;
+INSERT INTO notes (body) VALUES ('Проверка ожидания синхронной реплики');
+COMMIT;
+```
+
+`INSERT` внутри транзакции выполнится, а `COMMIT` будет ждать подтверждения
+синхронной реплики. Лидер и etcd работают; причина ожидания — отсутствие
+подтверждения WAL от реплики.
+
+Во втором терминале верни `pg1`:
+
+```bash
+docker compose start pg1
+```
+
+После её присоединения ожидающий `COMMIT` должен завершиться сам.
+Для этого упражнения возвращаем реплику, сохраняя ожидающий сеанс.
+Отмена ожидания или потеря соединения во время `COMMIT` требует проверки
+результата транзакции: отсутствие успешного ответа не доказывает откат.
+
+### Выключаем строгость и сравниваем поведение
+
+Сейчас `pg2` — лидер, `pg1` — синхронная реплика, `pg3` ещё остановлен.
+Во втором терминале:
+
+```bash
+make ctl NODE=pg2 ARGS="edit-config --set synchronous_mode_strict=false"
+docker compose kill -s SIGKILL pg1
+```
+
+Подтверди изменение конфигурации. В `psql` на лидере:
+
+```sql
+INSERT INTO notes (body)
+VALUES ('Запись без реплик в нестрогом режиме') RETURNING *;
+SHOW synchronous_standby_names;
+```
+
+После возможной короткой паузы Patroni отключит ожидание реплик, запись
+завершится, а `synchronous_standby_names` станет пустым. Подтверждённые в этом
+состоянии изменения могут находиться только на диске лидера.
+
+Верни обе реплики и дождись их присоединения:
+
+```bash
+docker compose start pg1 pg3
+make status NODE=pg2
+```
+
+`synchronous_mode` остаётся включённым. Когда подходящая реплика снова появилась,
+Patroni назначит её синхронной, и `COMMIT` опять будет ждать её подтверждения.
+
+| Все подходящие реплики недоступны | Поведение записи на работающем лидере |
+| --- | --- |
+| `synchronous_mode_strict=true` | `COMMIT` ждёт реплику |
+| `synchronous_mode_strict=false` | После реакции Patroni запись подтверждается только лидером |
+
+## 9. Потеря лидера и синхронной реплики
+
+`synchronous_mode_strict=false` разрешает живому лидеру работать без реплик.
+При `synchronous_mode=true` это не даёт асинхронной реплике права автоматически
+стать лидером после потери остальных узлов.
+
+### Оставляем только асинхронную реплику
+
+Проверь роли и конфигурацию:
+
+```bash
+make status NODE=pg2
+make ctl NODE=pg2 ARGS="show-config"
+```
+
+Для примера нужны `pg2 = Leader`, `pg3 = Sync Standby`, `pg1 = Replica`,
+`synchronous_mode=true`, `synchronous_node_count=1`. Если назначена другая
+синхронная реплика, замени имена в командах и выбери оставшийся узел для `NODE`.
+Все etcd остаются работать. Выйди из `psql` через `\q`.
+
+Выполни блок целиком, без паузы: сначала останавливается лидер, затем синхронная
+реплика. Так лидер не успеет назначить оставшийся узел синхронным до своего отказа.
+
+```bash
+docker compose kill -s SIGKILL pg2 &&
+docker compose kill -s SIGKILL pg3
+```
+
+Примерно через 30 секунд:
+
+```bash
+make status NODE=pg1
+docker compose exec pg1 psql -U postgres -d postgres \
+  -c 'SELECT pg_is_in_recovery();'
+```
+
+Ожидай `pg1 = Replica`, состояние `running`, `pg_is_in_recovery()=true`
+и отсутствие лидера. Даже нулевой показанный `Lag` не даёт этому узлу права
+на автоматическое повышение в данном режиме. Уже полученный WAL можно
+воспроизвести, но недоставленную часть в этом стенде получать больше неоткуда.
+
+### Возвращаем допустимого кандидата
+
+Верни только бывшую синхронную реплику:
+
+```bash
+docker compose start pg3
+make status NODE=pg1
+```
+
+При работающем DCS и успешных проверках Patroni повысит `pg3` автоматически.
+Появится новая timeline, `pg1` подключится к новому лидеру и сможет стать
+синхронной репликой.
+
+```bash
+make sql NODE=pg1
+```
+
+```sql
+SELECT inet_server_addr(), pg_is_in_recovery();
+INSERT INTO notes (body) VALUES ('Запись после возвращения pg3') RETURNING *;
+\q
+```
+
+После успешной записи верни бывшего лидера:
+
+```bash
+docker compose start pg2
+make status NODE=pg1
+docker compose exec pg2 psql -U postgres -d postgres \
+  -c "SELECT pg_is_in_recovery(); SELECT id, body FROM notes WHERE body = 'Запись после возвращения pg3';"
+```
+
+Ожидай, что `pg2` вернулся репликой и получил новую строку. Это автоматический
+выбор лидера после возвращения подходящего узла, а затем присоединение старого
+primary к новой истории.
+
+### Где данные, пока нет лидера
+
+Без лидера этот кластер не подтверждает новые операции записи. Приложение
+получает ошибку подключения либо ждёт до таймаута. Patroni не сохраняет
+неуспешные SQL-запросы в очередь. Для отложенной обработки нужна отдельная
+надёжная очередь и соответствующая логика приложения.
+
+Если запись была подтверждена до отказа лидера, её местонахождение зависит
+от режима в тот момент. В нестрогом режиме без реплик она могла остаться только
+на диске лидера. На границе сбоя результат `COMMIT` может быть неизвестен клиенту;
+при повторе операции нужен способ избежать дубликатов.
+
+Patroni управляет PostgreSQL, но для возврата самого процесса Patroni, контейнера
+или машины нужна работающая система запуска. Если безопасного кандидата вернуть
+не удалось, оператор исследует состояние узлов и источники восстановления.
+Принудительное повышение асинхронной реплики — отдельное решение с возможной
+потерей данных, которое в этом упражнении не выполняется.
+
+## 10. Пересоздание реплики после потери WAL — reinit
+
+При обычном возвращении реплика дочитывает WAL. Если нужные сегменты уже удалены
+и доступного архива нет, цепочку воспроизведения продолжить нельзя. Тогда нужна
+новая базовая копия данных. `patronictl reinit` пересоздаёт PostgreSQL на выбранной
+реплике и снова подключает её к потоку WAL.
+
+**Reinit заменяет весь каталог данных целевой реплики.** Перед подтверждением
+проверь имя узла и источник копии. В этом упражнении пересоздаём только `pg2`;
+лидер `pg3` и синхронная реплика `pg1` продолжают работать.
+
+### Проверяем роли и удержание WAL
+
+Для следующих команд исходное состояние такое:
+
+| Узел | Роль |
+| --- | --- |
+| `pg3` | Leader |
+| `pg1` | Sync Standby, streaming |
+| `pg2` | Асинхронная Replica, streaming — цель упражнения |
+
+```bash
+make status NODE=pg3
+make sql NODE=pg3
+```
+
+```sql
+SHOW wal_keep_size;
+SHOW max_slot_wal_keep_size;
+SHOW archive_mode;
+
+SELECT application_name, state, sync_state
+FROM pg_stat_replication ORDER BY application_name;
+
+SELECT slot_name, active, restart_lsn, wal_status
+FROM pg_replication_slots ORDER BY slot_name;
+\q
+```
+
+Ожидай `128MB`, `256MB`, `off`, две streaming-реплики, синхронную `pg1`
+и активные физические slots `pg1` и `pg2`. Запиши исходные значения хранения WAL:
+в конце их нужно вернуть. Если роли отличаются, сначала выбери фактическую
+асинхронную реплику и согласуй имена во всех командах этой главы.
+
+`wal_keep_size` сохраняет минимальный объём старых сегментов. Replication slot
+удерживает WAL для своей реплики, но `max_slot_wal_keep_size` ограничивает это
+удержание при checkpoint. Поэтому одной остановки реплики и пары вставок
+недостаточно, чтобы воспроизвести потерю WAL.
+
+### Уменьшаем удержание и останавливаем целевую реплику
+
+Для короткого локального упражнения временно уменьши удержание WAL:
+
+```bash
+make ctl NODE=pg3 ARGS="edit-config --pg wal_keep_size=16MB --pg max_slot_wal_keep_size=16MB"
+```
+
+Подтверди изменения и через несколько секунд проверь их на лидере:
+
+```bash
+docker compose exec pg3 psql -U postgres -d postgres \
+  -c 'SHOW wal_keep_size;' -c 'SHOW max_slot_wal_keep_size;'
+```
+
+Ожидай `16MB` для обоих параметров. Установленный Patroni отклоняет
+`wal_keep_size=0` и оставляет значение по умолчанию, поэтому здесь используем
+поддерживаемые `16MB`. Теперь останови только асинхронную реплику:
+
+```bash
+docker compose stop pg2
+```
+
+### Создаём реальный разрыв WAL
+
+```bash
+make sql NODE=pg3
+```
+
+```sql
+CREATE TABLE lab_wal_pressure (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY
+);
+
+DO $$
+BEGIN
+    FOR i IN 1..12 LOOP
+        INSERT INTO lab_wal_pressure DEFAULT VALUES;
+        PERFORM pg_switch_wal();
+    END LOOP;
+END;
+$$;
+
+CHECKPOINT;
+
+SELECT slot_name, active, restart_lsn, wal_status
+FROM pg_replication_slots ORDER BY slot_name;
+
+INSERT INTO notes (body)
+VALUES ('Запись во время отсутствия pg2') RETURNING *;
+\q
+```
+
+Вставки создают WAL, а `pg_switch_wal()` переключает сегменты. Двенадцать
+переключений продвигают WAL примерно на 192 МиБ при стандартном сегменте 16 МиБ,
+хотя в таблице всего двенадцать строк. Checkpoint позволяет применить лимит slot
+и убрать старые сегменты. Сам по себе `pg_switch_wal()` без новой WAL-активности
+не обязан каждый раз создавать следующий сегмент.
+
+У отставшего slot может появиться `wal_status=lost`. Patroni также может удалить
+и пересоздать непригодный slot.
+
+### Видим, почему обычного start недостаточно
+
+```bash
+docker compose start pg2
+make status NODE=pg3
+docker compose logs --tail=100 pg2
+```
+
+Ожидай в логах `requested WAL segment ... has already been removed`.
+`pg2` не сможет вернуться к `streaming`. Лидер и здоровая синхронная реплика
+должны продолжать работу. Если ошибки нет и `pg2` уже догнал лидера, разрыв WAL
+не воспроизведён: сначала проверь значения хранения WAL и выполнение checkpoint.
+
+### Пересоздаём только pg2
+
+Процесс Patroni на `pg2` должен работать и отвечать на REST API, даже если
+его PostgreSQL не может продолжить streaming. Имя кластера в команде — текущее
+значение `scope`; в этом проекте оно содержит пробелы и поэтому взято в кавычки.
+
+```bash
+make ctl NODE=pg3 ARGS="reinit 'how to drive ;)' pg2 --from-leader --wait"
+```
+
+Перед подтверждением проверь, что указан именно `pg2` в роли реплики.
+Patroni остановит её PostgreSQL, заменит каталог данных базовой копией и запустит
+реплику заново. `--from-leader` выбирает лидера источником `pg_basebackup`,
+`--wait` ожидает завершения пересоздания. Затем дождись `streaming`:
+
+```bash
+make status NODE=pg3
+docker compose exec pg2 psql -U postgres -d postgres \
+  -c 'SELECT pg_is_in_recovery();' \
+  -c "SELECT id, body FROM notes WHERE body = 'Запись во время отсутствия pg2';" \
+  -c 'SELECT count(*) FROM lab_wal_pressure;'
+```
+
+Ожидай `true`, новую строку из `notes` и `12` строк в таблице упражнения.
+Лидер и timeline при reinit реплики не должны меняться.
+
+### Возвращаем удержание WAL и проверяем дальнейшую репликацию
+
+Верни записанные исходные значения; для исходной конфигурации стенда:
+
+```bash
+make ctl NODE=pg3 ARGS="edit-config --pg wal_keep_size=128MB --pg max_slot_wal_keep_size=256MB"
+make sql NODE=pg3
+```
+
+```sql
+SHOW wal_keep_size;
+SHOW max_slot_wal_keep_size;
+
+INSERT INTO notes (body) VALUES ('После reinit pg2') RETURNING *;
+DROP TABLE lab_wal_pressure;
+\q
+```
+
+Если `SHOW` ещё показывает временные значения, подожди применения конфигурации
+и повтори проверку. Затем на пересозданной реплике:
+
+```bash
+docker compose exec pg2 psql -U postgres -d postgres \
+  -c "SELECT id, body FROM notes WHERE body = 'После reinit pg2';"
+make status NODE=pg3
+```
+
+Упражнение завершено, когда три узла работают, обе реплики находятся в
+`streaming`, новая запись дошла до `pg2`, а лимиты хранения WAL восстановлены.
+
 ## Команды и подключение с хоста
 
 | Назначение | Адрес |
@@ -285,11 +728,17 @@ make up
 
 ## Дальше
 
-Следующий этап: `synchronous_mode` и `synchronous_mode_strict`, измерение времени
-переключения и потерь, затем возврат реплики через `patronictl reinit`.
+Следующий этап: измерение времени недоступности и потерьпри непрерывной
+записивосстановление из WAL-архива и резервных копий, поведение приложения
+при переподключении и повторе транзакций.
+
+Автопроверка `make acceptance` пока покрывает базовый асинхронный сценарий.
 
 Официальные материалы:
 [конфигурация Patroni](https://patroni.readthedocs.io/en/latest/yaml_configuration.html),
 [patronictl](https://patroni.readthedocs.io/en/latest/patronictl.html),
 [REST API](https://patroni.readthedocs.io/en/latest/rest_api.html),
-[режимы репликации](https://patroni.readthedocs.io/en/latest/replication_modes.html).
+[режимы репликации](https://patroni.readthedocs.io/en/latest/replication_modes.html),
+[patronictl reinit](https://patroni.readthedocs.io/en/latest/patronictl.html#patronictl-reinit),
+[настройки удержания WAL](https://www.postgresql.org/docs/17/runtime-config-replication.html),
+[streaming replication и отсутствующий WAL](https://www.postgresql.org/docs/17/warm-standby.html#STREAMING-REPLICATION).
