@@ -24,18 +24,65 @@ def compose(*args, capture=False, check=True):
     )
 
 
-def sql(query, port=5000):
-    result = compose(
+def sql_result(query, port=5000, *, sqlstate=False):
+    return compose(
         'exec', '-T', '-e', f'LAB_SQL_PORT={port}', '-e', f'LAB_SQL={query}',
+        '-e', f'LAB_SQL_VERBOSITY={"sqlstate" if sqlstate else "default"}',
+        '-e', 'PGOPTIONS=-c statement_timeout=3000 -c lock_timeout=1000',
         'pg3', 'sh', '-c',
         'PGPASSWORD="$PATRONI_SUPERUSER_PASSWORD" PGCONNECT_TIMEOUT=2 '
-        'exec psql -XAt -v ON_ERROR_STOP=1 -h haproxy -p "$LAB_SQL_PORT" '
+        'exec psql -XAtw -v ON_ERROR_STOP=1 -v VERBOSITY="$LAB_SQL_VERBOSITY" '
+        '-h haproxy -p "$LAB_SQL_PORT" '
         '-U postgres -d postgres -c "$LAB_SQL"',
         capture=True, check=False,
     )
+
+
+def sql(query, port=5000):
+    result = sql_result(query, port)
     if result.returncode:
         raise RuntimeError(result.stderr.strip())
     return result.stdout.strip()
+
+
+def postgresql_not_writable(node):
+    result = compose(
+        'exec', '-T', '-e', 'PGCONNECT_TIMEOUT=2',
+        '-e', 'PGOPTIONS=-c statement_timeout=3000', node,
+        'psql', '-XAtw', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres', '-d', 'postgres',
+        '-c', 'SELECT pg_is_in_recovery()', capture=True, check=False,
+    )
+    if result.returncode == 0:
+        if result.stdout.strip() not in ('t', 'f'):
+            raise RuntimeError(f'{node}: unexpected recovery state: {result.stdout!r}')
+        return result.stdout.strip() == 't'
+    # A failed connection alone is insufficient: authenticate/socket errors must
+    # not be mistaken for demotion. pg_ctl exit 3 specifically means not running.
+    status = compose(
+        'exec', '-T', node, 'pg_ctl', '-D', '/var/lib/postgresql/patroni/data',
+        'status', capture=True, check=False,
+    )
+    if status.returncode == 3:
+        return True
+    raise RuntimeError(f'{node}: SQL check failed while PostgreSQL is not confirmed stopped: '
+                       f'{result.stderr.strip()}')
+
+
+def haproxy_rejects_write():
+    # Roll back even the successful positive control, preserving the two rows.
+    result = sql_result(
+        "BEGIN; INSERT INTO lab_probe VALUES (3, 'quorum write probe'); ROLLBACK",
+        sqlstate=True,
+    )
+    if result.returncode == 0:
+        return False
+    # psql exit 2 means a broken connection. For SQL errors, accept only a
+    # read-only transaction (25006), not a syntax/schema error in this probe.
+    if result.returncode == 2 or (
+        result.returncode == 3 and 'ERROR:  25006' in result.stderr
+    ):
+        return True
+    raise RuntimeError(f'Unexpected failure of HAProxy write probe: {result.stderr.strip()}')
 
 
 def members():
@@ -129,6 +176,11 @@ def exercise_cluster():
     ).stdout.strip() == '2')
 
     print('[5/5] Lose etcd quorum, then restore it', flush=True)
+    quorum_leader = leader()
+    if postgresql_not_writable(quorum_leader):
+        raise RuntimeError('Expected a writable primary before losing etcd quorum')
+    if haproxy_rejects_write():
+        raise RuntimeError('Expected writes through HAProxy before losing etcd quorum')
     compose('stop', 'etcd2', 'etcd3')
 
     def no_primary():
@@ -143,9 +195,17 @@ def exercise_cluster():
         return result.returncode == 0
 
     wait_for('all nodes stop advertising a writable primary', no_primary)
+    wait_for('former primary is stopped or in recovery',
+             lambda: postgresql_not_writable(quorum_leader))
+    wait_for('all PostgreSQL nodes are stopped or in recovery', lambda: all(
+        postgresql_not_writable(node) for node in ('pg1', 'pg2', 'pg3')
+    ))
+    wait_for('HAProxy rejects writes while etcd quorum is lost', haproxy_rejects_write)
     compose('start', 'etcd2', 'etcd3')
     wait_for('cluster recovers after etcd quorum is restored', healthy_cluster)
     wait_for('both rows remain readable through primary', lambda: sql('SELECT count(*) FROM lab_probe') == '2')
+    wait_for('HAProxy accepts writes after etcd quorum is restored',
+             lambda: not haproxy_rejects_write())
 
 
 def main():

@@ -312,7 +312,8 @@ make sql
 
 | Настройки | Что требуется для подтверждения COMMIT |
 | --- | --- |
-| `synchronous_commit=off`, синхронные реплики не назначены | WAL сохранён на диске лидера |
+| `synchronous_commit=off` | Сброс WAL на диск не ожидается; последние подтверждённые транзакции могут потеряться при аварии PostgreSQL |
+| `synchronous_commit=on`, синхронные реплики не назначены | WAL сохранён на диске лидера |
 | `synchronous_commit=on`, назначена одна синхронная реплика | WAL сохранён на диске лидера и этой реплики |
 
 Реплика с `sync_state=async` тоже получает WAL, но её подтверждение не требуется
@@ -928,6 +929,632 @@ make ctl NODE=pg2 ARGS="edit-config --set synchronous_mode=true --set synchronou
 Аварийное завершение клиента в этом промежутке может оставить результат
 неподтверждённым в журнале. Поэтому измерение требует завершённого файла.
 
+## 12. Поведение приложения: повтор без дубликатов
+
+В предыдущей главе клиент после ошибки переходил к следующему `seq`.
+Мы измеряли результаты попыток. Приложению часто нужно закончить именно
+исходную операцию — например, создать один заказ, несмотря на несколько
+попыток подключения и отправки SQL.
+
+### Что происходит при потере ответа
+
+Есть два разных результата с одинаковым симптомом для клиента:
+
+- PostgreSQL не сохранил операцию, успешного ответа нет.
+- PostgreSQL сохранил операцию, но соединение оборвалось до получения ответа.
+
+Безусловный повтор обычного INSERT может создать второй заказ во втором случае.
+Клиенту нужен постоянный идентификатор **логической операции**, который остаётся
+одинаковым при каждом её повторе. Это ключ идемпотентности: повтор той же
+операции с тем же ключом даёт тот же эффект в БД.
+
+### Создаём таблицу с ключом операции
+
+Проверь, что кластер работает. `NODE` может указывать на любой работающий узел:
+SQL-клиент подключается к primary через HAProxy.
+
+```bash
+make status
+make sql
+```
+
+```sql
+CREATE TABLE IF NOT EXISTS lab_requests (
+    request_id uuid PRIMARY KEY,
+    body text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+```
+
+`request_id` задаётся приложением до первой отправки и сохраняется для повторов.
+В упражнении используем фиксированный UUID, чтобы его можно было повторно
+скопировать. Ограничение PRIMARY KEY проверяет уникальность на стороне PostgreSQL,
+в том числе при конкурентных запросах.
+
+### Отправляем одну операцию дважды
+
+Выполни следующий запрос два раза с тем же UUID и тем же `body`:
+
+```sql
+INSERT INTO lab_requests (request_id, body)
+VALUES ('11111111-1111-4111-8111-111111111111', 'Учебный заказ')
+ON CONFLICT (request_id) DO NOTHING
+RETURNING *;
+```
+
+В первый раз ожидай одну строку и `INSERT 0 1`. Во второй — пустой RETURNING
+и `INSERT 0 0`: конфликт уникального ключа обработан без вставки дубликата.
+Если уже выполнял этот пример, строка может существовать с первого запроса.
+
+```sql
+SELECT count(*)
+FROM lab_requests
+WHERE request_id = '11111111-1111-4111-8111-111111111111';
+
+SELECT *
+FROM lab_requests
+WHERE request_id = '11111111-1111-4111-8111-111111111111';
+```
+
+Ожидай `count = 1`. Разные операции должны иметь разные ключи, а повтор одной
+операции сохраняет прежний ключ. Если при повторе генерировать новый UUID,
+PostgreSQL увидит новую операцию и сможет вставить ещё одну строку.
+
+### Что должен делать клиент при повторе
+
+`DO NOTHING RETURNING` не возвращает существующую строку. После успешного
+завершения такой попытки клиент отдельным SELECT читает результат по
+`request_id`, проверяет совпадение `body` и возвращает сохранённый результат.
+Один ключ с другими данными должен считаться конфликтом, а не новой операцией.
+
+Для обработчика с несколькими изменениями ключ операции и все изменения БД
+нужно фиксировать в одной транзакции. Отдельные внешние действия, например
+отправка письма или платёж во внешнем сервисе, требуют собственного согласования;
+уникальный ключ строки сам по себе их не дедуплицирует.
+
+При сетевой ошибке клиент открывает новое соединение через HAProxy и повторяет
+ту же операцию с тем же ключом. Число попыток или общее время ограничивается,
+между попытками нужна пауза. Ошибки данных и прав доступа не исправляются
+бесконечным повтором. Ниже проверим такое поведение практическим клиентом.
+
+Идемпотентность ограничивает дубликаты в сохранённой истории БД. Сохранность
+самой истории зависит от репликации и восстановления; этот ключ не заменяет
+синхронную репликацию или резервные копии.
+
+### Практический клиент с переподключением и ограниченными повторами
+
+`request_client.py` завершает одну логическую операцию. Как и клиент нагрузки,
+он работает на хосте, использует Python и установленный `psql`, читает пароль
+из `.env` и подключается к primary через HAProxy. Таблица `public.lab_requests`
+должна быть создана SQL-командой из начала этой главы.
+
+Передай UUID явно: он остаётся тем же при всех внутренних повторах и при
+повторном запуске программы. Выполни эту команду дважды:
+
+```bash
+python3 request_client.py 22222222-2222-4222-8222-222222222222 --body 'Заказ через клиент'
+```
+
+В обоих случаях ожидай `status: confirmed`, одну и ту же строку `request`
+и одинаковый `created_at`. Счётчик `attempts` относится к текущему запуску
+клиента. Подтверждение означает, что клиент получил результат записи и сверил
+его с исходной операцией; оно не обещает сохранность истории при любом отказе.
+
+Каждая попытка открывает новое соединение. В нём `INSERT ... ON CONFLICT DO
+NOTHING` фиксируется, затем отдельный `SELECT` читает строку с новым снимком
+данных. Это важно и при конкурентных запросах с тем же UUID. Клиент сверяет
+`request_id` и `body`, возвращает сохранённое время создания. Содержимое
+передаётся через экранируемые переменные `psql`, а не подставляется в SQL
+конкатенацией строк. Пример рассчитан на одно изменение строки; несколько
+связанных изменений потребуют общей транзакции.
+
+Проверь конфликт данных:
+
+```bash
+python3 request_client.py 22222222-2222-4222-8222-222222222222 --body 'Другой заказ'
+```
+
+Ожидай ошибку `request_id_conflict` и ненулевой код выхода. Ранее сохранённое
+содержимое не изменится. Ошибку нельзя исправить повтором с тем же неверным
+содержимым: для новой операции нужен новый ключ.
+
+По умолчанию пределы — 30 попыток, общее время 45 секунд, пауза 1 секунда.
+Отдельный вызов `psql` ограничен шестью секундами или оставшимся общим временем,
+если его меньше; также действуют таймауты подключения, SQL и ожидания блокировок.
+Пределы можно задать явно:
+
+```bash
+python3 request_client.py 22222222-2222-4222-8222-222222222222 --body 'Заказ через клиент' --max-attempts 30 --deadline 45 --retry-delay 1
+```
+
+Транспортные ошибки, таймауты, временная недоступность primary, deadlock и
+ошибка сериализации приводят к повтору. Для серверных ошибок используется
+SQLSTATE; ошибки SQL, прав доступа и данных завершают программу сразу.
+`psql` не предоставляет SQLSTATE начальных ошибок подключения через libpq:
+клиент отдельно различает отказ сервера и временный запуск/остановку по
+диагностике в локали C. Это ограничение учебного клиента на `psql`.
+
+При исчерпании лимитов клиент сообщает `not confirmed` и завершается с ошибкой.
+Это не означает, что строки нет: запись могла сохраниться до потери ответа.
+Повторный запуск с тем же UUID и исходным `body` позволяет получить результат.
+Ключ и содержимое должны переживать перезапуск приложения; здесь их сохраняет
+пользователь в команде, автоматического дискового журнала операций у клиента нет.
+
+### Проверяем переподключение во время выбора лидера
+
+Сначала дождись здорового кластера с синхронной репликой:
+
+```bash
+make status NODE=pg1
+```
+
+В примере лидер — `pg2`. Если лидер другой, замени имя только в командах
+остановки и возврата узла. Подготовь команду с новым ключом, останови лидера
+и сразу запусти клиент:
+
+```bash
+docker compose kill -s SIGKILL pg2
+python3 request_client.py 33333333-3333-4333-8333-333333333333 --body 'Заказ во время отказа' --deadline 60 --max-attempts 60
+```
+
+Клиент должен показать несколько неуспешных попыток, затем `confirmed` после
+появления нового primary. Если выборы уже закончились к моменту запуска,
+возможен успех с первой попытки. Если этот UUID уже использовался, программа
+получит прежнюю строку — для нового опыта выбери новый UUID.
+
+Повтори ту же команду после восстановления доступности, затем проверь через
+`make sql`:
+
+```sql
+SELECT request_id, body, created_at
+FROM public.lab_requests
+WHERE request_id = '33333333-3333-4333-8333-333333333333';
+
+SELECT count(*) FROM public.lab_requests
+WHERE request_id = '33333333-3333-4333-8333-333333333333';
+\q
+```
+
+Ожидай одну строку и `count=1`. Верни остановленный узел:
+
+```bash
+docker compose start pg2
+make status NODE=pg1
+```
+
+Дождись обеих streaming-реплик и `Sync Standby`. Этот опыт проверяет новое
+подключение после отказа сервера. Неопределённый результат после уже сохранённой
+операции отдельно моделируется в `test_request_client.py`: первая попытка
+сохраняет строку и теряет ответ, вторая возвращает прежний результат.
+
+Механизмы клиента: [переменные psql и SQL Interpolation](https://www.postgresql.org/docs/17/app-psql.html#APP-PSQL-INTERPOLATION),
+[коды ошибок PostgreSQL](https://www.postgresql.org/docs/17/errcodes-appendix.html).
+
+## 13. Обслуживание: настройки и последовательный перезапуск
+
+Теперь меняем конфигурацию работающего кластера. Сначала применим параметр
+без перезапуска, затем увидим `Pending restart` и перезапустим PostgreSQL
+по одному узлу с плановой передачей лидерства.
+
+### Где менять настройки
+
+| Источник | Для чего используется в этом стенде |
+| --- | --- |
+| `bootstrap.dcs` в `patroni.yaml` | Начальная общая конфигурация при создании кластера |
+| `patronictl edit-config` | Изменение общей конфигурации уже работающего кластера в etcd |
+| Локальный `patroni.yaml` и переменные окружения | Настройки конкретного процесса Patroni, например адреса узла |
+
+`show-config` показывает желаемую общую конфигурацию. Фактические значения
+на конкретном PostgreSQL смотри через `SHOW` или `pg_settings`.
+
+В Dockerfile файл `patroni.yaml` копируется внутрь образа. Правка файла на хосте
+не меняет его в существующем контейнере. Меняем параметры через DCS, поэтому
+пересборка образа не требуется.
+
+### Смотрим исходное состояние
+
+```bash
+make status
+make ctl ARGS="show-config"
+make sql
+```
+
+```sql
+SELECT name, setting, unit, context, pending_restart
+FROM pg_settings
+WHERE name IN ('log_min_duration_statement', 'shared_buffers')
+ORDER BY name;
+
+SELECT pg_postmaster_start_time();
+\q
+```
+
+Для исходного стенда ожидай:
+
+| Параметр | `setting` | `unit` | `context` | `pending_restart` |
+| --- | --- | --- | --- | --- |
+| `log_min_duration_statement` | `-1` | `ms` | `superuser` | `f` |
+| `shared_buffers` | `8192` | `8kB` | `postmaster` | `f` |
+
+`-1` отключает журналирование по длительности. `8192` блоков по `8kB` — это
+64 MiB; `SHOW shared_buffers` покажет `64MB`. Контекст `postmaster` означает,
+что новое значение вступает в силу только после запуска PostgreSQL.
+Запомни время запуска: оно поможет отличить reload от restart.
+Если значения отличаются, сохрани свои исходные значения для возможного отката.
+
+### Меняем параметр без перезапуска
+
+В терминале:
+
+```bash
+make ctl ARGS="edit-config --set postgresql.parameters.log_min_duration_statement=1000"
+```
+
+Patroni сам обнаружит обновление DCS и применит параметр;
+при `loop_wait=5` дай ему несколько секунд. Открой новое SQL-соединение:
+
+```bash
+make sql
+```
+
+```sql
+SHOW log_min_duration_statement;
+SELECT pg_postmaster_start_time();
+SELECT pg_sleep(1.2);
+\q
+```
+
+Ожидай `1s`, прежнее время запуска PostgreSQL и отсутствие `Pending restart`.
+Запрос с `pg_sleep` превысил порог в 1000 мс. Для исходного лидера `pg3`:
+
+```bash
+docker compose logs --since=2m pg3
+```
+
+Найди запись с длительностью запроса и `SELECT pg_sleep(1.2)`.
+Если лидер другой, смотри его логи. Здесь длительность намеренно создана
+ожиданием.
+
+`patronictl reload` перечитывает локальный конфиг Patroni и посылает PostgreSQL
+сигнал перечитать его конфигурацию. Для только что изменённого DCS он обычно
+не нужен. Чтобы отдельно попробовать reload на одном узле:
+
+```bash
+make ctl ARGS="reload 'how to drive ;)' pg3"
+```
+
+После обработки reload время `pg_postmaster_start_time()` остаётся прежним.
+
+### Получаем Pending restart
+
+Увеличим `shared_buffers` с `64MB` до `80MB`:
+
+```bash
+make ctl ARGS="edit-config --set postgresql.parameters.shared_buffers=80MB"
+make ctl ARGS="show-config"
+make status
+```
+
+Подтверди изменение и повторяй `make status`, пока у узлов не появится
+`Pending restart`. DCS уже содержит `80MB`, но работающие процессы ещё
+используют `64MB`. На primary через `make sql`:
+
+```sql
+SHOW shared_buffers;
+SELECT name, setting, unit, context, pending_restart
+FROM pg_settings
+WHERE name = 'shared_buffers';
+\q
+```
+
+Ожидай `64MB` и `pending_restart=t`. Reload не применит этот параметр:
+ему нужен restart PostgreSQL.
+
+### Перезапускаем реплики по одной
+
+Для команд ниже исходное состояние: лидер `pg3`, реплики `pg1` и `pg2`.
+Если роли другие, сначала согласуй имена с `make status`.
+Начнём с асинхронной реплики `pg2`:
+
+```bash
+make ctl NODE=pg1 ARGS="restart 'how to drive ;)' pg2 --pending"
+make status NODE=pg1
+```
+
+В интерактивных вопросах выбери немедленный перезапуск (`now`), не задавай
+условие по версии PostgreSQL и подтверди операцию. `--pending` выбирает узел
+только при наличии признака ожидающего перезапуска.
+Дождись `streaming` у `pg2` и исчезновения её `Pending restart`.
+Проверь именно эту реплику, подключившись локально внутри её контейнера:
+
+```bash
+docker compose exec pg2 psql -X -U postgres -d postgres -c "SHOW shared_buffers;"
+```
+
+Ожидай `80MB`. Затем отдельно перезапусти `pg1`:
+
+```bash
+make ctl NODE=pg2 ARGS="restart 'how to drive ;)' pg1 --pending"
+make status NODE=pg2
+```
+
+Дождись обеих streaming-реплик и назначения `Sync Standby`. При перезапуске
+синхронной реплики запись может ждать её замены; в текущем нестрогом режиме
+Patroni также может временно продолжить запись без синхронной реплики.
+Проверяй фактические роли после каждого шага.
+
+### Передаём лидерство и обслуживаем бывший primary
+
+Теперь обе реплики должны использовать `80MB`, а `pg3` ещё может ожидать
+перезапуска. Выбери в `make status` текущий `Sync Standby` для switchover.
+Если это `pg1`, команда такая; если `pg2` — замени кандидата:
+
+```bash
+make ctl NODE=pg1 ARGS="switchover --leader pg3 --candidate pg1"
+make status NODE=pg1
+```
+
+Подтверди переключение. Дождись нового лидера, возврата `pg3` в `streaming`
+и здоровой синхронной репликации. Проверь `SHOW shared_buffers` локально на
+`pg3`: при смене роли PostgreSQL мог уже перезапуститься и применить `80MB`.
+Если `Pending restart` сохранился, перезапусти бывшего лидера как реплику:
+
+```bash
+make ctl NODE=pg1 ARGS="restart 'how to drive ;)' pg3 --pending"
+make status NODE=pg1
+```
+
+Если признак уже исчез, дополнительный restart не требуется.
+Switchover разрывает существующие клиентские соединения; новые подключения
+через прежний адрес HAProxy попадут на нового лидера после обновления проверок.
+
+### Проверяем результат и убираем учебное логирование
+
+На каждом из `pg1`, `pg2`, `pg3` выполни прямую проверку, меняя имя контейнера:
+
+```bash
+docker compose exec pg1 psql -X -U postgres -d postgres -c "SELECT name, setting, unit, pending_restart FROM pg_settings WHERE name='shared_buffers';"
+docker compose exec pg1 psql -X -U postgres -d postgres -c "SHOW shared_buffers;"
+```
+
+На всех трёх ожидай `setting=10240`, `unit=8kB`, `pending_restart=f` — это
+`80MB`. Через `make sql` проверь доступность таблиц `notes` и `lab_requests`.
+
+Затем убери включённое логирование медленных запросов:
+
+```bash
+make ctl ARGS="edit-config --set postgresql.parameters.log_min_duration_statement=null"
+```
+
+Если настройка была задана раньше, верни сохранённое значение вместо `null`.
+После применения проверь его через `SHOW log_min_duration_statement`.
+`shared_buffers=80MB` оставляем как результат упражнения. Для возврата к
+`64MB` нужна такая же процедура изменения DCS и последовательного применения.
+
+Основа упражнения: [конфигурация Patroni](https://patroni.readthedocs.io/en/latest/patroni_configuration.html),
+[reload](https://patroni.readthedocs.io/en/latest/patronictl.html#patronictl-reload),
+[restart](https://patroni.readthedocs.io/en/latest/patronictl.html#patronictl-restart),
+[pg_settings](https://www.postgresql.org/docs/17/view-pg-settings.html).
+
+## 14. Pause/resume: режим обслуживания
+
+`pause` временно приостанавливает автоматическое управление PostgreSQL со
+стороны Patroni, в том числе автоматический failover. Такой режим нужен для
+работ, при которых оператор сам управляет состоянием PostgreSQL, например
+при отдельных процедурах обновления основной версии или восстановления.
+
+Работающие PostgreSQL продолжают обслуживать запросы и передавать WAL.
+Patroni продолжает публиковать состояние узлов в DCS, а работающий лидер —
+продлевать свою блокировку. Некоторые ручные операции через `patronictl`
+остаются доступны; pause не запрещает оператору переключать роли вручную.
+
+Если primary остановится в этом режиме, автоматического повышения реплики
+не будет. Поэтому упражнение выполняем на здоровом кластере и заканчиваем
+командой `resume`.
+
+### Фиксируем исходное состояние
+
+```bash
+make status NODE=pg1
+make ctl NODE=pg1 ARGS="show-config"
+make sql NODE=pg1
+```
+
+```sql
+SELECT pg_is_in_recovery(), pg_postmaster_start_time();
+\q
+```
+
+Ожидай один лидер, две streaming-реплики и `Sync Standby` в нашем синхронном
+режиме. В конфигурации `pause` должен отсутствовать или быть `false`.
+Запомни лидера, timeline и время запуска PostgreSQL.
+
+### Приостанавливаем автоматическое управление
+
+```bash
+make ctl NODE=pg1 ARGS="pause --wait"
+make status NODE=pg1
+make ctl NODE=pg1 ARGS="show-config"
+```
+
+`--wait` ждёт, пока все узлы увидят режим обслуживания. Ожидай сообщение
+об успешной приостановке, пометку `Maintenance mode: on` в статусе и
+`pause: true` в общей конфигурации. Само включение pause не меняет лидера
+и не перезапускает PostgreSQL.
+
+### Проверяем запросы и репликацию
+
+Создай отдельную учебную операцию через HAProxy:
+
+```bash
+python3 request_client.py 44444444-4444-4444-8444-444444444444 --body 'Запись в режиме pause'
+```
+
+Ожидай `confirmed`. Повторный запуск с этим UUID вернёт ту же строку.
+Через `make sql NODE=pg1` проверь время запуска и состояние отправителей WAL:
+
+```sql
+SELECT pg_is_in_recovery(), pg_postmaster_start_time();
+SELECT application_name, state, sync_state
+FROM pg_stat_replication
+ORDER BY application_name;
+\q
+```
+
+Ожидай `pg_is_in_recovery()=f`, прежнее время запуска и две streaming-реплики.
+Если лидер — `pg1`, проверь доставку строки непосредственно на реплике `pg2`:
+
+```bash
+docker compose exec pg2 psql -X -U postgres -d postgres -c "SELECT request_id, body FROM public.lab_requests WHERE request_id='44444444-4444-4444-8444-444444444444';"
+```
+
+Если `pg2` сейчас лидер, выбери другую работающую реплику. Дождись появления
+строки. Отдельно останавливать узлы для этой проверки не требуется.
+
+### Возвращаем автоматическое управление
+
+```bash
+make ctl NODE=pg1 ARGS="resume --wait"
+make status NODE=pg1
+make ctl NODE=pg1 ARGS="show-config"
+```
+
+Ожидай сообщение об успешном возобновлении управления. Пометка обслуживания
+должна исчезнуть, `pause` — отсутствовать или быть `false`. Проверь наличие
+одного лидера, двух streaming-реплик и `Sync Standby`.
+
+Основа упражнения: [Pause/Resume в Patroni](https://patroni.readthedocs.io/en/latest/pause.html),
+[patronictl pause](https://patroni.readthedocs.io/en/latest/patronictl.html#patronictl-pause),
+[patronictl resume](https://patroni.readthedocs.io/en/latest/patronictl.html#patronictl-resume).
+
+## 15. Диагностика: от симптома к причине
+
+Цель — сопоставить состояние контейнеров, координации, PostgreSQL и клиентского
+подключения. Диагностику выполняем после `resume` на здоровом кластере, чтобы
+сначала увидеть нормальные результаты. Для HTTP-команд нужен `curl` на хосте.
+
+### Контейнеры и роли
+
+```bash
+docker compose ps --all
+make status NODE=pg1
+make ctl NODE=pg1 ARGS="show-config"
+```
+
+Ожидай семь работающих контейнеров, один лидер, две streaming-реплики и
+`Sync Standby` при синхронном режиме. Проверь отсутствие `pause: true` и
+`Pending restart`. Состояние `healthy` зависит от конкретного healthcheck:
+например, у HAProxy он проверяет синтаксис конфигурации. Подключение к БД
+через HAProxy проверяется отдельно ниже.
+
+### HTTP-проверки, которые использует HAProxy
+
+В текущем примере лидер — `pg1`. Проверь `/primary` каждого узла:
+
+```bash
+curl -sS --max-time 3 -o /dev/null -w 'pg1 /primary: %{http_code}\n' http://127.0.0.1:8001/primary
+curl -sS --max-time 3 -o /dev/null -w 'pg2 /primary: %{http_code}\n' http://127.0.0.1:8002/primary
+curl -sS --max-time 3 -o /dev/null -w 'pg3 /primary: %{http_code}\n' http://127.0.0.1:8003/primary
+```
+
+Ожидай `200`, `503`, `503`. На здоровой реплике `503` для `/primary` означает,
+что она не подходит для записи через этот endpoint. Сравни проверки `pg2` и `pg3`:
+
+```bash
+curl -sS --max-time 3 -o /dev/null -w 'pg2 /health: %{http_code}\n' http://127.0.0.1:8002/health
+curl -sS --max-time 3 -o /dev/null -w 'pg2 /replica: %{http_code}\n' http://127.0.0.1:8002/replica
+curl -sS --max-time 3 -o /dev/null -w 'pg3 /health: %{http_code}\n' http://127.0.0.1:8003/health
+curl -sS --max-time 3 -o /dev/null -w 'pg3 /replica: %{http_code}\n' http://127.0.0.1:8003/replica
+```
+
+Оба ответа должны быть `200`. `/health` проверяет работающий PostgreSQL,
+`/primary` — primary с блокировкой лидера, `/replica` — подходящую для чтения
+реплику с учётом её тега `noloadbalance`. Порт `8001` относится к `pg1`,
+`8002` — к `pg2`, `8003` — к `pg3`, независимо от их ролей.
+
+### Здоровье etcd
+
+Проверяй все три endpoint, указав их явно:
+
+```bash
+docker compose exec etcd1 etcdctl --endpoints=http://etcd1:2379,http://etcd2:2379,http://etcd3:2379 endpoint health --write-out=table
+docker compose exec etcd1 etcdctl --endpoints=http://etcd1:2379,http://etcd2:2379,http://etcd3:2379 endpoint status --write-out=table
+```
+
+Ожидай три `HEALTH=true`, одного Raft-лидера etcd и пустые поля ошибок.
+Лидер etcd и primary PostgreSQL — разные роли в разных системах. При ошибках
+DCS смотри также логи etcd и Patroni; `patronictl list` сам зависит от DCS.
+
+### Фактическая репликация PostgreSQL
+
+```bash
+make sql NODE=pg1
+```
+
+```sql
+SELECT pg_is_in_recovery(), inet_server_addr(), inet_server_port();
+
+SHOW synchronous_standby_names;
+
+SELECT application_name, state, sync_state,
+       pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) AS replay_lag_bytes
+FROM pg_stat_replication
+ORDER BY application_name;
+
+SELECT pid, state, wait_event_type, wait_event
+FROM pg_stat_activity
+WHERE wait_event = 'SyncRep';
+\q
+```
+
+На primary ожидай `pg_is_in_recovery()=f`, две строки репликации в `streaming`,
+одну `sync` и одну `async`. На спокойном здоровом стенде отставание обычно
+нулевое; под записью оно может кратковременно расти. Ноль строк для `SyncRep` значит
+сейчас нет сессий, ожидающих синхронного подтверждения. Сам синхронный режим включён.
+Если запись зависает на нём, проверяй доступность синхронной реплики и
+настройки `synchronous_mode_strict`.
+
+### Подключение через HAProxy
+
+Предыдущий SQL шёл через primary-endpoint HAProxy. Теперь подключись к
+read-endpoint:
+
+```bash
+make sql NODE=pg1 PORT=5001
+```
+
+```sql
+SELECT pg_is_in_recovery(), inet_server_addr(), inet_server_port();
+\q
+```
+
+Ожидай `pg_is_in_recovery()=t`. Отдельное подключение может попасть на другую
+реплику. `NODE=pg1` определяет контейнер клиента, роль целевой БД выбирает
+HAProxy. `inet_server_port()` показывает порт PostgreSQL за HAProxy — `5432`.
+
+### Если результат отличается
+
+| Симптом | Что проверять дальше |
+| --- | --- |
+| Контейнер остановлен или перезапускается | `docker compose logs --tail=100 pg2` для нужного сервиса |
+| Лидера нет | Здоровье etcd, режим pause, доступность допустимых кандидатов, логи Patroni |
+| PostgreSQL работает, но `/primary` возвращает 503 | Его роль, блокировку лидера и состояние DCS |
+| Прямой SQL к узлу работает, через HAProxy — нет | HTTP-проверки роли, логи HAProxy, доступность портов и сети |
+| COMMIT ждёт `SyncRep` | Синхронную реплику и строгость синхронного режима |
+| Реплика не догоняет или не запускается | WAL receiver, удержание WAL и сообщения об отсутствующем сегменте; затем упражнение reinit |
+| Настройка в DCS отличается от SHOW | `pending_restart`, контекст параметра, локальные и сессионные переопределения |
+
+Для истории переключений:
+
+```bash
+make ctl NODE=pg1 ARGS="history"
+docker compose logs --since=5m pg1 pg2 pg3 haproxy
+```
+
+Основа упражнения: [REST API Patroni](https://patroni.readthedocs.io/en/latest/rest_api.html),
+[проверка состояния etcd](https://etcd.io/docs/v3.6/tasks/operator/how-to-check-cluster-status/),
+[представления статистики PostgreSQL](https://www.postgresql.org/docs/17/monitoring-stats.html).
+
 ## Команды и подключение с хоста
 
 Расшифровка `sql`, `ctl` и параметров `NODE`, `ARGS`, `PORT` —
@@ -969,17 +1596,26 @@ make up
 и удаляет свои контейнеры и volumes в конце. Она проверяет две streaming-реплики,
 маршрутизацию SQL, запрет записи на реплике, switchover, SIGKILL лидера,
 возврат бывшего лидера и восстановление после потери кворума etcd.
+При потере кворума проверяются ответы REST API, прямое состояние PostgreSQL
+на всех узлах (реплика либо остановлен) и отказ записи через HAProxy.
 Перед отказом тест ждёт доставки контрольной строки на все узлы.
 Это проверка конкретного сценария, а не гарантия отсутствия потерь в async-режиме.
 
-## Дальше
+## Итоговая проверка
 
-Следующий этап: поведение приложения при переподключении и повторе транзакций,
-затем обслуживание Patroni — изменения настроек, последовательный перезапуск узлов,
-pause/resume и диагностика.
+```bash
+make check
+make acceptance
+```
 
-`make check` проверяет в том числе расчёт отчёта нагрузки. Автопроверка
-`make acceptance` покрывает базовый асинхронный сценарий.
+`make check` проверяет расчёт отчёта нагрузки и поведение клиента при повторах,
+неопределённом результате и исчерпании лимитов. Автопроверка `make acceptance`
+покрывает базовый асинхронный сценарий.
+
+Успешный итог acceptance: `PASS: replication, routing, switchover, failover,
+rejoin, etcd quorum.` Временный кластер должен удалиться после прогона;
+основной стенд и его учебные данные сохраняются. Журналы измерений сохраняются
+отдельно в `.local/workload/`.
 
 Официальные материалы:
 [конфигурация Patroni](https://patroni.readthedocs.io/en/latest/yaml_configuration.html),
@@ -989,3 +1625,5 @@ pause/resume и диагностика.
 [patronictl reinit](https://patroni.readthedocs.io/en/latest/patronictl.html#patronictl-reinit),
 [настройки удержания WAL](https://www.postgresql.org/docs/17/runtime-config-replication.html),
 [streaming replication и отсутствующий WAL](https://www.postgresql.org/docs/17/warm-standby.html#STREAMING-REPLICATION).
+[INSERT и ON CONFLICT](https://www.postgresql.org/docs/17/sql-insert.html),
+[коды ошибок PostgreSQL](https://www.postgresql.org/docs/17/errcodes-appendix.html).

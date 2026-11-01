@@ -44,7 +44,7 @@ down:
 check: setup
 	$(DC) config --quiet
 	python3 -c "import ast,pathlib; [ast.parse(p.read_text()) for p in pathlib.Path('.').glob('*.py')]"
-	python3 -m unittest -v test_workload
+	python3 -m unittest -v test_workload test_request_client
 
 acceptance: setup
 	python3 acceptance.py
