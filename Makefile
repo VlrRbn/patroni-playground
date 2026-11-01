@@ -2,8 +2,11 @@
 DC = docker compose
 NODE ?= pg1
 PORT ?= 5000
+DURATION ?= 60
+INTERVAL ?= 0.1
+JOURNAL ?= latest
 
-.PHONY: help setup up status sql ctl logs down check acceptance
+.PHONY: help setup up status sql ctl logs down check acceptance load load-report
 help:
 	@echo 'make up         				— собрать и запустить кластер'
 	@echo 'make status     				— посмотреть роли узлов'
@@ -13,6 +16,8 @@ help:
 	@echo 'make logs      				— логи всех сервисов'
 	@echo 'make down       				— остановить, сохранив данные'
 	@echo 'make acceptance 				— проверить отказы в отдельном временном кластере'
+	@echo 'make load DURATION=60 		— непрерывная запись с журналом подтверждений'
+	@echo 'make load-report 			— сверить последний журнал с текущим лидером'
 	@echo 'При остановленном pg1 добавь NODE=pg2 или NODE=pg3.'
 
 setup:
@@ -39,6 +44,13 @@ down:
 check: setup
 	$(DC) config --quiet
 	python3 -c "import ast,pathlib; [ast.parse(p.read_text()) for p in pathlib.Path('.').glob('*.py')]"
+	python3 -m unittest -v test_workload
 
 acceptance: setup
 	python3 acceptance.py
+
+load: setup
+	python3 workload.py write --duration "$(DURATION)" --interval "$(INTERVAL)"
+
+load-report:
+	@python3 workload.py report "$(JOURNAL)"
